@@ -234,6 +234,9 @@ func (s *Server) dialUDPUpstream(ctx context.Context, target string) (net.Conn, 
 	if s.cfg.EgressInterface != "" {
 		dialer.Control = bindEgressInterface(s.cfg.EgressInterface)
 	}
+	if s.resolver != nil {
+		dialer.Resolver = s.resolver
+	}
 	return dialer.DialContext(ctx, s.outboundNetwork("udp"), target)
 }
 

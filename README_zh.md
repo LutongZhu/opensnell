@@ -36,6 +36,7 @@ HTTP/3 加速，请将 OpenSnell 服务端搭配 **Surge** 客户端，或任何
 | Dynamic Record Sizing（v5）           | ✅             | ✅             |
 | `egress-interface`（v5）              | ✅             | —              |
 | `ipv6` 出站地址族开关（v5）           | ✅             | —              |
+| 自定义上游 DNS（`dns = …`）           | ✅             | —              |
 | TCP Fast Open（仅 Linux）             | ✅             | ✅             |
 | **QUIC 代理模式（v5）**               | ✅             | 使用 Surge     |
 
@@ -124,6 +125,14 @@ egress-interface =
 ; 服务端监听哪些地址仍由 `listen` 控制（如需 v6 双栈入站，请写
 ; `[::]:2333`）。
 ipv6 = true
+
+; 上游 DNS 服务器列表，逗号分隔。可选，默认留空（走 /etc/resolv.conf
+; 的系统解析器）。用于解析客户端请求里的目标域名。每一项是 v4 或 v6
+; 的 IP 字面量，可带 `:port` 后缀；不写端口时默认 53。多个服务器按顺序
+; 重试。对应官方 Surge snell-server 在 v4.1.0 加的 `dns = …` 选项。
+; 启动时每个生效的服务器会输出一行
+;   level=INFO msg="effective DNS" server=<addr>
+dns =
 
 ; TCP Fast Open（RFC 7413）。可选，默认 false。启用后，入站 TCP
 ; 监听器和出站上游 TCP 拨号都会设置 TFO，让 snell 客户端第一次写入的

@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"gopkg.in/ini.v1"
@@ -79,6 +80,24 @@ func loadServerConfig(path string) (snell.ServerConfig, error) {
 		QUIC:            sec.Key("quic").MustBool(true),
 		IPv6:            sec.Key("ipv6").MustBool(true),
 		TFO:             sec.Key("tfo").MustBool(false),
+		DNS:             parseDNSList(sec.Key("dns").MustString("")),
 	}
 	return cfg, nil
+}
+
+// parseDNSList splits a "dns = 1.1.1.1, 8.8.8.8" value into a clean list
+// of entries, trimming whitespace and dropping empties. Matches Surge's
+// comma-separated syntax.
+func parseDNSList(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }

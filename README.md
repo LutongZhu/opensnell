@@ -39,6 +39,7 @@ the current Surge `snell-server` speaks.
 | Dynamic Record Sizing (v5)            | ✅             | ✅             |
 | `egress-interface` (v5)               | ✅             | —              |
 | `ipv6` outbound family toggle (v5)    | ✅             | —              |
+| Custom upstream DNS (`dns = …`)       | ✅             | —              |
 | TCP Fast Open (Linux only)            | ✅             | ✅             |
 | **QUIC proxy mode (v5)**              | ✅             | use Surge      |
 
@@ -129,6 +130,16 @@ egress-interface =
 ; outbound; what addresses the server LISTENS on is still controlled
 ; by `listen` (write `[::]:2333` for v6 dual-stack inbound).
 ipv6 = true
+
+; Comma-separated list of upstream DNS servers used to resolve
+; client-requested hostnames. Optional, default empty (use the host's
+; system resolver via /etc/resolv.conf). Each entry is an IP literal
+; (v4 or v6) with an optional `:port` suffix; if no port is given, 53
+; is assumed. Servers are tried in order on each lookup. Matches the
+; official Surge snell-server `dns = …` directive added in v4.1.0.
+; Each configured server is logged at startup as
+;   level=INFO msg="effective DNS" server=<addr>
+dns =
 
 ; TCP Fast Open (RFC 7413). Optional, default false. When enabled,
 ; both the inbound TCP listener and outbound upstream TCP dials get

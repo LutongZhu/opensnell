@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -79,15 +80,76 @@ type ServerConfig struct {
 	// `cat /proc/sys/net/ipv4/tcp_fastopen` is `3` (or at least has the
 	// server bit set: 2).
 	TFO bool
+
+	// DNS, when non-empty, overrides the host's default resolver for
+	// upstream hostname resolution. Each entry is an IP literal (v4 or
+	// v6) with an optional `:port` suffix; if no port is given, 53 is
+	// assumed. Servers are tried in order on each lookup until one
+	// returns a response. When empty, the host's system resolver is
+	// used (typically /etc/resolv.conf).
+	//
+	// Matches the official Surge snell-server `dns = …` directive
+	// added in v4.1.0. Equivalent log line at startup is "effective
+	// DNS: <addr>" for each configured server.
+	DNS []string
 }
 
 // Server is a snell v4/v5 server. Use NewServer + Serve, or pass an
 // accepted net.Listener to ServeListener if you want to manage the socket
 // yourself.
 type Server struct {
-	cfg    ServerConfig
-	psk    []byte
-	logger *slog.Logger
+	cfg      ServerConfig
+	psk      []byte
+	logger   *slog.Logger
+	resolver *net.Resolver // nil when cfg.DNS is empty (use system resolver)
+}
+
+// buildResolver returns a net.Resolver that round-trips its DNS queries
+// through the user-configured `dns = …` servers, or nil when no custom
+// DNS servers are configured (in which case the system resolver is used,
+// matching the historical behavior).
+//
+// Each upstream is an "ip[:port]" string; missing port defaults to 53.
+// Servers are tried in order; the first to return a response wins.
+// PreferGo: true ensures we go through this Dial hook rather than
+// falling back to libc's getaddrinfo (which would silently ignore our
+// custom resolver list).
+func (s *Server) buildResolver() *net.Resolver {
+	if len(s.cfg.DNS) == 0 {
+		return nil
+	}
+	servers := make([]string, 0, len(s.cfg.DNS))
+	for _, entry := range s.cfg.DNS {
+		host := strings.TrimSpace(entry)
+		if host == "" {
+			continue
+		}
+		if _, _, err := net.SplitHostPort(host); err != nil {
+			host = net.JoinHostPort(host, "53")
+		}
+		servers = append(servers, host)
+	}
+	if len(servers) == 0 {
+		return nil
+	}
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 5 * time.Second}
+			var lastErr error
+			for _, server := range servers {
+				conn, err := d.DialContext(ctx, network, server)
+				if err == nil {
+					return conn, nil
+				}
+				lastErr = err
+			}
+			if lastErr == nil {
+				lastErr = errors.New("no configured DNS server is reachable")
+			}
+			return nil, lastErr
+		},
+	}
 }
 
 func NewServer(cfg ServerConfig, logger *slog.Logger) (*Server, error) {
@@ -111,6 +173,12 @@ func NewServer(cfg ServerConfig, logger *slog.Logger) (*Server, error) {
 	}
 	if cfg.QUIC {
 		logger.Info("snell quic proxy mode enabled")
+	}
+	if r := s.buildResolver(); r != nil {
+		s.resolver = r
+		for _, addr := range cfg.DNS {
+			logger.Info("effective DNS", "server", addr)
+		}
 	}
 	if cfg.TFO {
 		if !tfoSupported() {
@@ -154,9 +222,13 @@ func chainListenControl(fns ...func(string, string, syscall.RawConn) error) func
 }
 
 // dialer returns a net.Dialer configured with the server's dial timeout,
-// optional egress-interface binding, and optional TFO connect.
+// optional egress-interface binding, optional TFO connect, and the
+// custom DNS resolver when `dns = …` is set.
 func (s *Server) dialer() net.Dialer {
 	d := net.Dialer{Timeout: s.cfg.DialTimeout}
+	if s.resolver != nil {
+		d.Resolver = s.resolver
+	}
 	var controls []func(string, string, syscall.RawConn) error
 	if s.cfg.EgressInterface != "" {
 		controls = append(controls, bindEgressInterface(s.cfg.EgressInterface))
