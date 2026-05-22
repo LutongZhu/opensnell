@@ -16,6 +16,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -216,15 +217,29 @@ func (s *Server) handleTCP(ctx context.Context, stream *Snell, br *bufio.Reader,
 		_ = tc.SetKeepAlive(true)
 	}
 
-	if _, err := stream.Write([]byte{ResponseTunnel}); err != nil {
-		return false, err
-	}
+	// Lazy CONNECT response: instead of immediately writing the single
+	// ResponseTunnel byte as its own frame, defer it until the first
+	// real upstream→client data and merge them into one frame. Matches
+	// Surge v5 server's Dynamic Record Sizing optimization (smaller and
+	// more "natural-looking" first frame on the wire).
+	lazy := &lazyResponseStream{Conn: stream}
 
 	// Wrap the stream so the relay sees client's zero-chunk half-close as
 	// io.EOF (instead of an error). This lets utils.Relay terminate
 	// gracefully when the client sends its zero chunk.
-	left := &serverReadConn{Conn: stream, br: br}
+	left := &serverReadConn{Conn: lazy, br: br}
 	utils.Relay(left, upstream)
+
+	// If the relay ended without the server ever writing anything (e.g.,
+	// upstream connected and immediately closed without sending data),
+	// the client is still waiting for the ResponseTunnel byte. Emit a
+	// standalone-ResponseTunnel + zero-chunk frame pair so the client
+	// sees a clean tunnel-established-and-EOF sequence.
+	if !lazy.sent.Load() {
+		if _, err := lazy.Write(nil); err != nil {
+			return false, nil
+		}
+	}
 
 	if !reuse {
 		return false, nil
@@ -234,7 +249,7 @@ func (s *Server) handleTCP(ctx context.Context, stream *Snell, br *bufio.Reader,
 	// to the client one more time, then send our zero chunk and ensure
 	// the client's zero chunk has been drained.
 	_ = stream.Conn.SetReadDeadline(time.Time{})
-	if _, err := stream.Write(nil); err != nil {
+	if _, err := lazy.Write(nil); err != nil {
 		return false, nil
 	}
 	if !left.zeroChunkSeen {
@@ -254,6 +269,62 @@ func (s *Server) handleTCP(ctx context.Context, stream *Snell, br *bufio.Reader,
 		}
 	}
 	return true, nil
+}
+
+// lazyResponseStream wraps the snell stream so the first non-error
+// response byte (ResponseTunnel) is merged with the first frame of
+// upstream→client relay data, instead of being sent as its own frame.
+//
+// Behavior on Write:
+//   - First call with len(p) > 0: send AEAD(ResponseTunnel || p) in one
+//     frame, return n=len(p) on success.
+//   - First call with len(p) == 0: send ResponseTunnel as its own frame,
+//     then forward the zero-chunk (half-close) frame.
+//   - Subsequent calls: pass through unchanged.
+//
+// The status flag uses atomic.Bool because Write is called from the
+// relay's goroutine and the caller may inspect `sent` from another
+// goroutine to decide whether to emit a fallback at end-of-session.
+type lazyResponseStream struct {
+	net.Conn
+	mu   sync.Mutex
+	sent atomic.Bool
+}
+
+func (l *lazyResponseStream) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.sent.Load() {
+		return l.Conn.Write(p)
+	}
+	l.sent.Store(true)
+
+	if len(p) == 0 {
+		// No upstream data ever flowed. Emit ResponseTunnel by itself,
+		// then forward the requested zero chunk so the client sees a
+		// proper half-close after the tunnel-established signal.
+		if _, err := l.Conn.Write([]byte{ResponseTunnel}); err != nil {
+			return 0, err
+		}
+		return l.Conn.Write(p)
+	}
+
+	merged := make([]byte, 1+len(p))
+	merged[0] = ResponseTunnel
+	copy(merged[1:], p)
+	n, err := l.Conn.Write(merged)
+	if err != nil {
+		return 0, err
+	}
+	// The caller asked us to write len(p) bytes; we wrote 1+len(p).
+	// Report back len(p) on success so io.Copy accounting stays sane.
+	if n < len(merged) {
+		// Partial write — translate proportionally, but the snell
+		// frame writer always writes whole frames, so this branch is
+		// effectively unreachable in practice.
+		return 0, io.ErrShortWrite
+	}
+	return len(p), nil
 }
 
 // serverReadConn wraps a *Snell + bufio.Reader so that:
