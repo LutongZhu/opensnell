@@ -35,7 +35,27 @@ the current Surge `snell-server` speaks.
 | `ipv6` outbound family toggle (v5)    | ✅             | —              |
 | **QUIC proxy mode (v5)**              | ✅             | use Surge      |
 
-## Build
+## Install
+
+### One-line server installer (Linux + systemd)
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/missuo/opensnell/main/install.sh)
+```
+
+The interactive installer:
+
+- Lets you pick between **OpenSnell** (default, GPLv3, all-platform) or
+  the **official Surge `snell-server v5.0.1`** (closed-source, Linux only).
+- Generates a random PSK with `openssl` if you leave it blank.
+- Picks an unused random port in `10000–60000` if you leave the port blank.
+- Writes `/etc/snell/snell-server.conf`, installs a systemd unit
+  (`snell-server.service`), opens the port in UFW / firewalld if either
+  is active, and starts the service.
+- Re-run with `reconfigure`, `update`, `uninstall`, `start`, `stop`,
+  `restart`, `status`, or `info` — see `./install.sh help`.
+
+### Build from source
 
 ```sh
 go build -o snell-server ./cmd/snell-server
@@ -62,7 +82,7 @@ go install github.com/missuo/opensnell/cmd/snell-client@latest
 ; When `quic = true` (default) the server also listens for UDP on the
 ; same port for QUIC proxy mode, so make sure both TCP/<port> and
 ; UDP/<port> are open in any firewall in front of the host.
-listen = 0.0.0.0:8388
+listen = 0.0.0.0:2333
 
 ; Pre-shared key. Required. Treated as a raw UTF-8 string (NOT base64
 ; decoded) — keep this exactly as configured on the client side.
@@ -100,7 +120,7 @@ egress-interface =
 ; resolver only considers A records and AAAA lookups are skipped.
 ; Useful on hosts whose IPv6 path is broken or slow. Only affects
 ; outbound; what addresses the server LISTENS on is still controlled
-; by `listen` (write `[::]:8388` for v6 dual-stack inbound).
+; by `listen` (write `[::]:2333` for v6 dual-stack inbound).
 ipv6 = true
 ```
 
@@ -143,7 +163,7 @@ settings, application SOCKS5 hooks, etc.).
 listen = 127.0.0.1:1080
 
 ; Remote snell server, host:port. Required.
-server = your-server.example.com:8388
+server = your-server.example.com:2333
 
 ; Pre-shared key, must match the server's `psk` byte-for-byte.
 psk = your-shared-secret
@@ -195,7 +215,7 @@ and disable Surge's per-connection QUIC block:
 
 ```ini
 [Proxy]
-my-snell = snell, your-server.example.com, 8388, psk=your-shared-secret, version=5, tfo=true, block-quic=off
+my-snell = snell, your-server.example.com, 2333, psk=your-shared-secret, version=5, tfo=true, block-quic=off
 ```
 
 When Surge dispatches an HTTP/3 connection through `my-snell`, it wraps

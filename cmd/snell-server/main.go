@@ -71,7 +71,7 @@ func loadServerConfig(path string) (snell.ServerConfig, error) {
 	// We mirror that: any `version` key the user puts in the config is
 	// silently ignored (consistent with the official binary's behavior).
 	cfg := snell.ServerConfig{
-		Listen:          sec.Key("listen").MustString("0.0.0.0:8388"),
+		Listen:          sec.Key("listen").MustString("0.0.0.0:2333"),
 		PSK:             sec.Key("psk").MustString(""),
 		ObfsMode:        sec.Key("obfs").MustString("off"),
 		UDP:             sec.Key("udp").MustBool(true),
