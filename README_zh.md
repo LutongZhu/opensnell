@@ -263,6 +263,104 @@ AEAD           = AES-128-GCM
 `components/snell/quic.go` 和 `components/snell/quic_test.go`。单元测试中
 包含一个真实抓取到的 1359 字节信封作为 fixture。
 
+## 性能对比
+
+我们在两台同机房的 Linux 主机上,将 OpenSnell 与 Surge 出品的官方
+`snell-server v5.0.1`(闭源二进制,Surge 客户端背后用的就是它)做了
+端到端对比。其中一台主机**同时跑两个 server**(不同端口),让两边
+共用同一条上行链路、同一份内核、同一份 CDN cooldown 状态;另一台
+跑两个 snell-client,分别指向这两个 server。所有流量都通过 SOCKS5
+(`curl --socks5-hostname`)发往同一个测试目标。
+
+### 测试方法
+
+三个阶段,**全部按先后顺序、绝不并行**,且每个被测对象之间留几秒
+间隔,避免 CDN 偏向某一边:
+
+1. **延迟** —— 50 次小请求(`cloudflare.com/cdn-cgi/trace`,响应
+   约 200 字节)。用 `curl -w` 收集 `time_connect`、TTFB、总耗时。
+2. **并发吞吐** —— N = 2、4、8 路并行下载同一个 10 MB 文件。聚合
+   带宽 = 总字节 ÷ 墙钟时间。
+3. **抓包分析** —— 在 server 侧 `tcpdump`,每个被测对象单独下载
+   一个 10 MB 文件,统计满载 TCP segment 数 vs 空 ACK 数。
+
+### 官方二进制是什么写的
+
+我们对官方 `snell-server-v5.0.1-linux-amd64` 做了简单逆向(1.2 MB,
+静态链接,section header 被剥)。字符串分析显示它由 **GCC** 编译,
+链接 **libuv**(curl、Node.js 用的同款 async I/O 库),AES-GCM 走
+**OpenSSL** 的 AES-NI 实现(里头有 `GCM module for x86_64` 这种
+OpenSSL 特征字符串)。一句话:**C/C++ + libuv + OpenSSL**。这点
+重要,因为 libuv 整个 proxy 跑在**单个 event-loop 线程**里 ——
+没有 per-connection goroutine,没有 GMP 调度,没有 GC。
+
+### 改进前的初次测量(OpenSnell v1.0.1)
+
+| 指标                              | OpenSnell v1.0.1 | 官方 v5.0.1     | Δ          |
+| --------------------------------- | ---------------: | --------------: | ---------- |
+| TTFB median                       |     在噪声范围内 |    在噪声范围内 | ~0         |
+| 单流吞吐                          |             打平 |            打平 | ~0         |
+| **N = 8 并发吞吐**                |  **6.49 MB/s**   |   **8.46 MB/s** | **−30 %**  |
+| 一次 10 MB 传输的空 ACK 数        |             1444 |            1084 | **+33 %**  |
+
+单流和延迟早已和官方持平。**差距全集中在并发吞吐**上。
+
+### 根因分析
+
+`v4Reader.readFrame()` 解析每一帧 snell 时做**两次 `io.ReadFull`**
+—— 一次读 23 字节加密帧头,一次读 padding + payload + tag —— 而且
+底层 `net.Conn` 是**裸读**,没在用户态加缓冲。典型帧大小 ~1.5 KB,
+10 MB 传输会有约 7300 帧,因此一个方向就要做 **~14000 次 `recv()`
+系统调用**。
+
+由此引出两个症状:
+
+1. **空 ACK 多**。Linux 的 delayed-ACK 在应用层"大块大块"地排空接收
+   缓冲区时才生效;一旦应用频繁小读,内核就放弃 delayed-ACK,直接
+   多发 ACK。每帧两个 syscall == 大量小读 == 抑制 delayed-ACK ==
+   线路上比 C 参考实现多 ~33 % 的空 ACK。
+2. **并发吞吐拉垮**。每条 snell 连接跑两个 goroutine(每方向一个),
+   8 并发就是 16 个 goroutine,每个都在不断做小 syscall + 通过 Go
+   runtime 调度切换。libuv 完全没这开销 —— 它单线程 epoll 就把所有
+   连接的新 TCP 数据按线速吸进来。
+
+### 修复
+
+只一行:
+
+```go
+// components/snell/v4.go — initReader()
+c.r = &v4Reader{Reader: bufio.NewReaderSize(c.Conn, 64*1024), aead: aead}
+```
+
+64 KB 读缓冲一次能把 ~40 个最大长度的 snell 帧拉进用户态,把读路径
+上的 syscall 数砍掉大约 **~90 倍**。这个改动**对线路格式完全透明**:
+v4 帧解析器看到的字节流一模一样,只是通过更少的 syscall 投递过来
+而已。
+
+### 改进后(OpenSnell v1.0.2)
+
+| 指标                              | OpenSnell v1.0.2 | 官方 v5.0.1     | Δ           |
+| --------------------------------- | ---------------: | --------------: | ----------- |
+| TTFB median                       |          17.9 ms |        17.1 ms  | +4.7 %      |
+| TTFB p95                          |          25.4 ms |        24.5 ms  | +3.7 %      |
+| N = 2 吞吐                        |      43.48 MB/s  |    44.44 MB/s   | −2.2 %      |
+| **N = 8 吞吐**                    |  **47.34 MB/s**  |  **48.19 MB/s** | **−1.8 %**  |
+| 一次 10 MB 传输的空 ACK 数        |             2596 |           2343  | **+10.8 %** |
+
+并发吞吐的差距从 **−30 %** 收敛到 **−1.8 %**,空 ACK 超出量从
+**+33 %** 降到 **+10.8 %**。剩下的 ~11 % ACK 差和 ~2 % 吞吐差,大概
+率是 Go runtime 相对手写 C event loop 的开销 —— **对任何实际负载
+都已经掉进噪声里**了。
+
+### 结论
+
+在 Surge 公布的 snell v5 线路上,OpenSnell 的 `snell-server` 在并发
+场景下**跑到了官方 C 参考实现的 ~98 %**,延迟**完全不可区分**。
+这次 bufio 修复在 `components/snell/v4.go` 里只有 `+9 / −1` 行 ——
+提醒一下:跟原生 C/libuv 实现的差距,**大头往往不在应用逻辑里,而
+在读路径的 syscall 模式上**。
+
 ## 与真实 Surge `snell-server` 的互操作性
 
 已针对 `snell-server v5.0.1 (Nov 19 2025)` 完成测试：

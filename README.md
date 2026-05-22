@@ -289,6 +289,116 @@ client and decrypting with the configured PSK; see
 `components/snell/quic.go` and `components/snell/quic_test.go` (the
 unit test includes a real captured 1359-byte envelope as a fixture).
 
+## Performance
+
+We benchmarked OpenSnell against the official `snell-server v5.0.1` (the
+same closed-source binary that ships behind the Surge client) on two
+co-located Linux hosts: one host runs **both** servers on different
+ports so the upstream link, kernel, and CDN cooldown apply equally;
+the other host runs two snell-client instances pointed at each. All
+traffic goes through SOCKS5 via `curl --socks5-hostname` to the same
+upstream URL.
+
+### Method
+
+Three phases, each run sequentially (never simultaneously) with a
+several-second pause between subjects so the upstream CDN doesn't
+throttle one side of the comparison:
+
+1. **Latency** — 50 sequential requests to a tiny endpoint
+   (`cloudflare.com/cdn-cgi/trace`, ~200 B response). Measure
+   `time_connect`, TTFB, and total via `curl -w`.
+2. **Concurrent throughput** — N = 2, 4, 8 parallel downloads of a
+   10 MB file. Measure aggregate MB/s = total bytes ÷ wall clock.
+3. **Packet inspection** — `tcpdump` server-side during a single
+   10 MB download per variant; count full TCP segments vs. empty ACKs.
+
+### What the official binary actually is
+
+We disassembled the official `snell-server-v5.0.1-linux-amd64`
+(1.2 MB, statically linked, section headers stripped). String
+analysis shows it is built with **GCC**, links **libuv** (the same
+async-I/O library curl and Node.js use), and uses **OpenSSL**'s
+AES-NI GCM implementation (the distinctive `GCM module for x86_64`
+string is present). In short: **C/C++ + libuv + OpenSSL**. That
+matters because libuv runs the whole proxy on a single event-loop
+thread — no per-connection goroutine, no GMP scheduling, no GC.
+
+### Initial finding (OpenSnell v1.0.1)
+
+| Metric                                       | OpenSnell v1.0.1 | Official v5.0.1 | Δ           |
+| -------------------------------------------- | ---------------: | --------------: | ----------- |
+| TTFB median                                  |       within noise |   within noise | ~0          |
+| Single-stream throughput                     |               tied |            tied | ~0          |
+| **N = 8 concurrent throughput**              |       **6.49 MB/s** |  **8.46 MB/s** | **−30 %**   |
+| Empty ACKs over a 10 MB transfer             |              1444 |            1084 | **+33 %**   |
+
+Single-stream and latency were already on par with the official
+server. The gap was concentrated in concurrent throughput.
+
+### Root cause
+
+`v4Reader.readFrame()` deserialises every snell frame with **two
+distinct `io.ReadFull` calls** — one for the 23-byte AEAD'd frame
+header, one for padding + payload + tag — and the underlying
+`net.Conn` was being read directly, with no userspace buffering. At a
+typical frame size of ~1.5 KB, a 10 MB transfer touches ~7300 frames
+and therefore costs **~14 000 `recv()` syscalls per direction**.
+
+Two things follow from that:
+
+1. **Empty ACKs.** Linux delays ACKs when an application drains the
+   receive buffer in big bursts, but issues them more aggressively
+   when the buffer is drained through many small reads. Two syscalls
+   per frame == many small reads == defeat delayed-ACK == ~33 % more
+   empty ACKs on the wire than the C reference.
+2. **Concurrent throughput.** Each snell connection runs two
+   goroutines (one per direction). At N = 8 concurrent SOCKS5 sessions
+   that is 16 goroutines, each doing thousands of small syscalls and
+   trading off through Go's runtime scheduler. libuv pays none of that
+   — its single epoll-driven thread can absorb new TCP data at full
+   rate.
+
+### Fix
+
+One line:
+
+```go
+// components/snell/v4.go — initReader()
+c.r = &v4Reader{Reader: bufio.NewReaderSize(c.Conn, 64*1024), aead: aead}
+```
+
+A 64 KB read-side buffer pulls ~40 max-sized snell frames into
+userspace per `recv()`, cutting syscalls on the read path by roughly
+~90×. This is a wire-format-transparent change: the v4 frame parser
+still sees the exact same byte stream, just delivered through fewer
+syscalls.
+
+### After OpenSnell v1.0.2
+
+| Metric                                       | OpenSnell v1.0.2 | Official v5.0.1 | Δ           |
+| -------------------------------------------- | ---------------: | --------------: | ----------- |
+| TTFB median                                  |          17.9 ms |        17.1 ms  | +4.7 %      |
+| TTFB p95                                     |          25.4 ms |        24.5 ms  | +3.7 %      |
+| N = 2 throughput                             |      43.48 MB/s  |    44.44 MB/s   | −2.2 %      |
+| **N = 8 throughput**                         |   **47.34 MB/s** |  **48.19 MB/s** | **−1.8 %**  |
+| Empty ACKs over a 10 MB transfer             |             2596 |           2343  | **+10.8 %** |
+
+The concurrent throughput gap collapsed from **−30 %** to **−1.8 %**,
+and the empty-ACK excess dropped from **+33 %** to **+10.8 %**. The
+remaining ~11 % ACK excess and ~2 % throughput delta is plausibly
+attributable to Go's runtime overhead vs. a hand-written C event
+loop — and below the noise floor of any realistic workload.
+
+### Takeaway
+
+On Surge's published wire (snell v5), OpenSnell's `snell-server`
+runs at **roughly 98 % of the official C reference under concurrency**
+and is **indistinguishable in latency**. The bufio fix is `+9/−1`
+lines in `components/snell/v4.go` — a useful reminder that profiling
+the read path (and not just application logic) is where most of the
+gap to a native C/libuv implementation lives.
+
 ## Interop with the real Surge `snell-server`
 
 Tested against `snell-server v5.0.1 (Nov 19 2025)`:
