@@ -89,8 +89,9 @@ detect_arch_surge() {
 }
 
 ensure_tools() {
+    # unzip only needed for the Surge variant. curl/openssl/ss are core.
     local missing=()
-    for t in curl tar unzip openssl ss; do
+    for t in curl unzip openssl ss; do
         command -v "$t" >/dev/null 2>&1 || missing+=("$t")
     done
     if [ "${#missing[@]}" -gt 0 ]; then
@@ -166,34 +167,33 @@ prompt_yesno() {
 # ============================================================================
 download_opensnell() {
     print_header "Downloading OpenSnell"
-    local arch tag url archive workdir
+    local arch tag url
     arch=$(detect_arch_opensnell)
     tag=$(curl -fsSL "$OPENSNELL_RELEASE_API" | grep '"tag_name":' | head -1 | sed -E 's/.*"([^"]+)".*/\1/' || true)
     if [ -z "$tag" ]; then
-        print_warning "Could not resolve latest release from GitHub API"
-        print_info "Falling back to 'main' branch source build is out of scope for this installer."
-        print_error "Please install OpenSnell manually for now."
+        print_error "Could not resolve latest release from GitHub API."
+        print_info "Build from source instead: go install github.com/${OPENSNELL_REPO}/cmd/snell-server@latest"
         exit 1
     fi
-    archive="opensnell-linux-${arch}.tar.gz"
-    url="https://github.com/${OPENSNELL_REPO}/releases/download/${tag}/${archive}"
+    # The release publishes raw, per-target binaries — no archive wrapper.
+    # Linux assets are unsuffixed; Windows ones end in .exe but we don't
+    # consume those here (this installer is Linux-only by design).
+    url="https://github.com/${OPENSNELL_REPO}/releases/download/${tag}/snell-server-linux-${arch}"
 
     print_info "Variant:      OpenSnell (self-hosted, GPLv3)"
     print_info "Architecture: linux/${arch}"
     print_info "Version:      ${tag}"
     print_info "Source:       ${url}"
 
-    workdir=$(mktemp -d)
-    trap 'rm -rf "$workdir"' EXIT
-
-    if ! curl -fL --progress-bar -o "$workdir/$archive" "$url"; then
+    local tmp; tmp=$(mktemp)
+    trap 'rm -f "$tmp"' RETURN
+    if ! curl -fL --progress-bar -o "$tmp" "$url"; then
         print_error "Download failed."
         print_info "If this is the first release, the GitHub Actions build may not have produced binaries yet."
         print_info "You can also build from source: go install github.com/${OPENSNELL_REPO}/cmd/snell-server@latest"
         exit 1
     fi
-    tar -xzf "$workdir/$archive" -C "$workdir"
-    install -m 0755 "$workdir"/*/snell-server "$INSTALL_BIN"
+    install -m 0755 "$tmp" "$INSTALL_BIN"
     print_success "Installed OpenSnell ${tag} → ${INSTALL_BIN}"
 
     echo "variant=opensnell" >  "$META_FILE.tmp"

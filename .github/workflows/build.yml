@@ -19,17 +19,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { goos: linux,   goarch: amd64,                                                ext: ''     }
-          - { goos: linux,   goarch: arm64,                                                ext: ''     }
-          - { goos: linux,   goarch: 386,                                                  ext: ''     }
-          - { goos: linux,   goarch: arm,     goarm: '7',                                  ext: ''     }
-          - { goos: linux,   goarch: mips64,  goflags: -tags=noargon2sse                                 }
-          - { goos: linux,   goarch: mips64le, goflags: -tags=noargon2sse                                }
-          - { goos: darwin,  goarch: amd64,                                                ext: ''     }
-          - { goos: darwin,  goarch: arm64,                                                ext: ''     }
-          - { goos: windows, goarch: amd64,                                                ext: '.exe' }
-          - { goos: windows, goarch: arm64,                                                ext: '.exe' }
-          - { goos: freebsd, goarch: amd64,                                                ext: ''     }
+          - { goos: linux,   goarch: amd64,                ext: ''     }
+          - { goos: linux,   goarch: arm64,                ext: ''     }
+          - { goos: linux,   goarch: 386,                  ext: ''     }
+          - { goos: linux,   goarch: arm,     goarm: '7',  ext: ''     }
+          - { goos: linux,   goarch: mips64,               ext: ''     }
+          - { goos: linux,   goarch: mips64le,             ext: ''     }
+          - { goos: darwin,  goarch: amd64,                ext: ''     }
+          - { goos: darwin,  goarch: arm64,                ext: ''     }
+          - { goos: windows, goarch: amd64,                ext: '.exe' }
+          - { goos: windows, goarch: arm64,                ext: '.exe' }
+          - { goos: freebsd, goarch: amd64,                ext: ''     }
     env:
       GOOS:   ${{ matrix.goos }}
       GOARCH: ${{ matrix.goarch }}
@@ -53,7 +53,7 @@ jobs:
             echo "version=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build server + client
+      - name: Build server + client (raw binaries, named per-target)
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -63,30 +63,10 @@ jobs:
           go build -trimpath -ldflags="$ldflags" -o "dist/snell-client-${suffix}${{ matrix.ext }}" ./cmd/snell-client
           ls -la dist/
 
-      - name: Package archive
-        run: |
-          set -euo pipefail
-          cd dist
-          suffix="${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}"
-          archive="opensnell-${suffix}"
-          mkdir -p "$archive"
-          mv "snell-server-${suffix}${{ matrix.ext }}" "$archive/snell-server${{ matrix.ext }}"
-          mv "snell-client-${suffix}${{ matrix.ext }}" "$archive/snell-client${{ matrix.ext }}"
-          if [[ "${{ matrix.goos }}" == "windows" ]]; then
-            zip -qr "${archive}.zip" "$archive"
-            sha256sum "${archive}.zip" > "${archive}.zip.sha256"
-            ls -la "${archive}.zip"*
-          else
-            tar -czf "${archive}.tar.gz" "$archive"
-            sha256sum "${archive}.tar.gz" > "${archive}.tar.gz.sha256"
-            ls -la "${archive}.tar.gz"*
-          fi
-          rm -rf "$archive"
-
       - uses: actions/upload-artifact@v4
         with:
           name: opensnell-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}
-          path: dist/opensnell-*
+          path: dist/*
           if-no-files-found: error
           retention-days: 14
 
@@ -119,9 +99,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/opensnell-*.tar.gz
-            artifacts/opensnell-*.tar.gz.sha256
-            artifacts/opensnell-*.zip
-            artifacts/opensnell-*.zip.sha256
+            artifacts/snell-server-*
+            artifacts/snell-client-*
           generate_release_notes: true
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
