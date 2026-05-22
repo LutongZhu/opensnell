@@ -299,15 +299,22 @@ download_opensnell() {
     print_info "Version:      ${tag}"
     print_info "Source:       ${url}"
 
-    local tmp; tmp=$(mktemp)
-    trap 'rm -f "$tmp"' RETURN
+    # Use explicit cleanup rather than a RETURN trap. A non-`-T` RETURN
+    # trap stays armed *globally* after this function returns, so every
+    # subsequent function-return fires it again — and by then $tmp is
+    # out of scope, which under `set -u` blows up with "tmp: unbound
+    # variable". Explicit cleanup is simpler and side-effect-free.
+    local tmp
+    tmp=$(mktemp)
     if ! curl -fL --progress-bar -o "$tmp" "$url"; then
+        rm -f "$tmp"
         print_error "Download failed."
         print_info "If this is the first release, the GitHub Actions build may not have produced binaries yet."
         print_info "You can also build from source: go install github.com/${OPENSNELL_REPO}/cmd/snell-server@latest"
         exit 1
     fi
     install -m 0755 "$tmp" "$INSTALL_BIN"
+    rm -f "$tmp"
     print_success "Installed OpenSnell ${tag} → ${INSTALL_BIN}"
 
     echo "variant=opensnell" >  "$META_FILE.tmp"
@@ -327,15 +334,16 @@ download_surge() {
     print_info "Source:       ${url}"
     print_warning "By proceeding you accept Surge's license terms."
 
+    # Same reasoning as download_opensnell: explicit cleanup, no trap.
     workdir=$(mktemp -d)
-    trap 'rm -rf "$workdir"' EXIT
-
     if ! curl -fL --progress-bar -o "$workdir/snell.zip" "$url"; then
+        rm -rf "$workdir"
         print_error "Download failed from $url"
         exit 1
     fi
     unzip -q "$workdir/snell.zip" -d "$workdir"
     install -m 0755 "$workdir/snell-server" "$INSTALL_BIN"
+    rm -rf "$workdir"
     print_success "Installed Surge snell-server ${SURGE_VERSION} → ${INSTALL_BIN}"
 
     echo "variant=surge"             >  "$META_FILE.tmp"
