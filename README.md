@@ -6,9 +6,7 @@ both a server (`snell-server`) and a client (`snell-client`).
 - Snell v5 server is wire-compatible with Snell v4 clients (no separate code
   path); both versions share the same AEAD frame format. See
   [evaluation notes](#protocol-notes).
-- The original v1/v2 implementation lives in the sibling project
-  [opensnellv1-2](../opensnellv1-2) (kept for reference); this project does
-  **not** support v1/v2/v3.
+- This project does **not** support Snell v1, v2, or v3.
 
 ## Build
 
@@ -103,6 +101,17 @@ clients:
 
 The pool also caps each TCP at `maxUsesPerConn = 2` sessions, matching
 the conservative behavior we saw from the real v5 server.
+
+## References
+
+- [MetaCubeX/mihomo#2816](https://github.com/MetaCubeX/mihomo/pull/2816) — earlier
+  reverse-engineered Snell v5 proposal (closed in favor of #2817); the description
+  of the AEAD frame layout and padding interleave was the starting point for this
+  implementation.
+- [MetaCubeX/mihomo#2817](https://github.com/MetaCubeX/mihomo/pull/2817) — merged
+  Snell v4/v5 outbound + inbound for mihomo; the protocol layer here is a port of
+  that code, adapted into a standalone server/client and stripped of v1/v2/v3
+  support.
 
 ## License
 
