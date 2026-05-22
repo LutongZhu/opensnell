@@ -144,6 +144,65 @@ get_ipv4() {
         || echo "YOUR_SERVER_IP"
 }
 
+# cc_to_flag converts a 2-letter ISO country code to the corresponding
+# regional-indicator flag emoji. e.g. "JP" -> "🇯🇵". Returns nothing on
+# invalid input. Two-step: build the format string (with the hex
+# codepoints inlined) and then printf -e it, because `printf '\U%08x'`
+# does not work — `\U` must be followed by literal hex digits in the
+# format string, not a placeholder.
+cc_to_flag() {
+    local cc
+    cc=$(printf '%s' "${1:-}" | tr '[:lower:]' '[:upper:]')
+    [ "${#cc}" = 2 ] || return 0
+    case "$cc" in *[!A-Z]*) return 0 ;; esac
+    local a_ord b_ord hex_a hex_b
+    a_ord=$(printf '%d' "'${cc:0:1}")
+    b_ord=$(printf '%d' "'${cc:1:1}")
+    hex_a=$(printf '%08x' $(( 0x1F1E6 + a_ord - 65 )))
+    hex_b=$(printf '%08x' $(( 0x1F1E6 + b_ord - 65 )))
+    # The format string now contains literal hex digits after \U, so
+    # bash's printf can interpret it as a Unicode codepoint pair.
+    printf "\\U${hex_a}\\U${hex_b}"
+}
+
+# fetch_geo populates GEO_IP and GEO_COUNTRY in two steps:
+#   1) get our public IPv4 from ip.sb (plain text response)
+#   2) look up that IP via api.ipinfo.es for the country code
+# Both steps have short timeouts. On total failure GEO_IP / GEO_COUNTRY
+# stay empty and generate_node_name falls back to a generic random name.
+fetch_geo() {
+    GEO_IP=""
+    GEO_COUNTRY=""
+    GEO_IP=$(curl -s -4 --max-time 5 https://ip.sb 2>/dev/null | tr -d '[:space:]')
+    # Validate looks like an IPv4 octet quartet (be conservative).
+    case "$GEO_IP" in
+        *[!0-9.]*|"") GEO_IP="" ;;
+    esac
+    [ -z "$GEO_IP" ] && return 0
+    local json
+    json=$(curl -s -4 --max-time 5 "https://api.ipinfo.es/ipinfo?ip=${GEO_IP}" 2>/dev/null || true)
+    GEO_COUNTRY=$(echo "$json" | grep -o '"country":"[^"]*"' | head -1 | cut -d'"' -f4)
+    case "$GEO_COUNTRY" in *[!A-Za-z]*) GEO_COUNTRY="" ;; esac
+}
+
+# generate_node_name produces a Surge-style label such as "🇯🇵 JP A1B2".
+# Requires fetch_geo to have been called first. Falls back to a generic
+# "OpenSnell <random4>" when geo lookup yielded no country code, so the
+# installer never fails for lack of geo data.
+generate_node_name() {
+    local flag suffix
+    flag=$(cc_to_flag "${GEO_COUNTRY:-}")
+    suffix=$(LC_ALL=C tr -dc 'A-Z0-9' </dev/urandom 2>/dev/null | head -c 4)
+    [ -z "$suffix" ] && suffix=$(date +%s | tail -c 5)
+    if [ -n "$flag" ] && [ -n "${GEO_COUNTRY:-}" ]; then
+        printf '%s %s %s' "$flag" "$GEO_COUNTRY" "$suffix"
+    elif [ -n "${GEO_COUNTRY:-}" ]; then
+        printf '%s %s' "$GEO_COUNTRY" "$suffix"
+    else
+        printf 'OpenSnell %s' "$suffix"
+    fi
+}
+
 # Make sure the kernel has TFO fully enabled (bit 0 + bit 1 = 3).
 # If the running kernel already reports 3, we DON'T touch the user's
 # system — we only write `tfo = true` to opensnell.conf and trust the
@@ -368,14 +427,28 @@ EOF
     chmod 600 "$CONFIG_FILE"
     print_success "Configuration written to $CONFIG_FILE"
 
+    # --- Resolve public IP, country, and node name for the Surge proxy
+    # line printed at the end. Best-effort: if api.ip.sb is unreachable
+    # we still publish a useful (IP-only) name.
+    print_info "Resolving public IP via ip.sb..."
+    fetch_geo
+    local node_name
+    node_name=$(generate_node_name)
+    print_info "Public IP: ${BOLD}${GEO_IP}${NC}${GEO_COUNTRY:+  Country: ${GEO_COUNTRY}}"
+    print_info "Node name: ${BOLD}${node_name}${NC}"
+
     # --- Persist meta ---
     if [ -f "$META_FILE.tmp" ]; then mv "$META_FILE.tmp" "$META_FILE"; fi
     {
-        grep -v '^\(port\|psk\|obfs\|ipv6\)=' "$META_FILE" 2>/dev/null || true
+        grep -vE '^(port|psk|obfs|ipv6|tfo|node_name|geo_ip|geo_country)=' "$META_FILE" 2>/dev/null || true
         echo "port=$port"
         echo "psk=$psk"
         echo "obfs=$obfs"
         echo "ipv6=$ipv6"
+        echo "tfo=$tfo"
+        echo "node_name=$node_name"
+        echo "geo_ip=$GEO_IP"
+        echo "geo_country=$GEO_COUNTRY"
     } > "${META_FILE}.tmp" && mv "${META_FILE}.tmp" "$META_FILE"
     chmod 600 "$META_FILE"
 }
@@ -450,28 +523,50 @@ show_info() {
         print_warning "No installation metadata found; is the server installed?"
         return 1
     fi
-    local variant version port psk obfs ipv6 ip
-    variant=$(grep '^variant=' "$META_FILE" | cut -d= -f2)
-    version=$(grep '^version=' "$META_FILE" | cut -d= -f2)
-    port=$(grep    '^port='    "$META_FILE" | cut -d= -f2)
-    psk=$(grep     '^psk='     "$META_FILE" | cut -d= -f2)
-    obfs=$(grep    '^obfs='    "$META_FILE" | cut -d= -f2)
-    ipv6=$(grep    '^ipv6='    "$META_FILE" | cut -d= -f2)
-    ip=$(get_ipv4)
+    local variant version port psk obfs ipv6 tfo node_name geo_ip ip
+    variant=$(grep   '^variant='     "$META_FILE" | cut -d= -f2-)
+    version=$(grep   '^version='     "$META_FILE" | cut -d= -f2-)
+    port=$(grep      '^port='        "$META_FILE" | cut -d= -f2-)
+    psk=$(grep       '^psk='         "$META_FILE" | cut -d= -f2-)
+    obfs=$(grep      '^obfs='        "$META_FILE" | cut -d= -f2-)
+    ipv6=$(grep      '^ipv6='        "$META_FILE" | cut -d= -f2-)
+    tfo=$(grep       '^tfo='         "$META_FILE" | cut -d= -f2-)
+    node_name=$(grep '^node_name='   "$META_FILE" | cut -d= -f2-)
+    geo_ip=$(grep    '^geo_ip='      "$META_FILE" | cut -d= -f2-)
+
+    # Prefer the IP we resolved at install time; if that wasn't captured
+    # (e.g. ip.sb was down then), try again now, and last-ditch fall back
+    # to a guaranteed-non-empty placeholder.
+    ip="${geo_ip:-}"
+    if [ -z "$ip" ]; then
+        ip=$(get_ipv4)
+    fi
+    [ -z "$ip" ] && ip="YOUR_SERVER_IP"
+
+    # Node name should always be present (build_config writes one even
+    # when ip.sb fails). Regenerate on the fly if somehow missing.
+    if [ -z "$node_name" ]; then
+        fetch_geo || true
+        node_name=$(generate_node_name)
+    fi
 
     print_header "Connection Info"
+    echo -e "${BOLD}Node name:${NC}    ${node_name}"
     echo -e "${BOLD}Variant:${NC}      ${variant} (${version})"
     echo -e "${BOLD}Server IP:${NC}    ${ip}"
     echo -e "${BOLD}Port:${NC}         ${port}"
     echo -e "${BOLD}PSK:${NC}          ${psk}"
     echo -e "${BOLD}obfs:${NC}         ${obfs}"
     echo -e "${BOLD}IPv6 egress:${NC}  ${ipv6}"
+    echo -e "${BOLD}TFO:${NC}          ${tfo}"
 
-    print_header "Surge proxy config"
-    local quic_flag=""
-    [ "$variant" = "opensnell" ] && quic_flag=", block-quic=off"
-    [ "$variant" = "surge"     ] && quic_flag=", block-quic=off"
-    echo -e "${GREEN}my-snell = snell, ${ip}, ${port}, psk=${psk}, version=5, tfo=true${quic_flag}${NC}"
+    # Surge proxy line. We deliberately omit `block-quic` (it's `auto`
+    # by default on the Surge side, which is what we want) and only
+    # advertise `tfo=true` when this server actually negotiated it.
+    print_header "Surge proxy line (copy into your Surge [Proxy] section)"
+    local tfo_param=""
+    [ "$tfo" = "true" ] && tfo_param=", tfo=true"
+    echo -e "${GREEN}${node_name} = snell, ${ip}, ${port}, psk=\"${psk}\", version=5${tfo_param}${NC}"
 
     print_header "Service"
     systemctl is-active --quiet "$SERVICE_NAME" \
