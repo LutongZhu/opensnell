@@ -64,6 +64,21 @@ type ServerConfig struct {
 	// `ipv6 = true`). Note this only affects outbound; what addresses
 	// the server LISTENS on is controlled by `Listen`.
 	IPv6 bool
+
+	// TFO enables TCP Fast Open (RFC 7413) on the inbound TCP listener
+	// AND on outbound upstream TCP dials. With TFO, the client's first
+	// data write can ride along in the SYN, eliminating one round-trip
+	// per fresh TCP connection. Surge's per-proxy `tfo=true` configures
+	// the same.
+	//
+	// Linux only for now (uses TCP_FASTOPEN and TCP_FASTOPEN_CONNECT
+	// setsockopt). On other platforms the option is silently no-op
+	// (macOS may still negotiate TFO transparently via its kernel
+	// sysctl, but we don't actively force it). Off by default; before
+	// enabling on Linux make sure
+	// `cat /proc/sys/net/ipv4/tcp_fastopen` is `3` (or at least has the
+	// server bit set: 2).
+	TFO bool
 }
 
 // Server is a snell v4/v5 server. Use NewServer + Serve, or pass an
@@ -97,26 +112,82 @@ func NewServer(cfg ServerConfig, logger *slog.Logger) (*Server, error) {
 	if cfg.QUIC {
 		logger.Info("snell quic proxy mode enabled")
 	}
+	if cfg.TFO {
+		if !tfoSupported() {
+			logger.Warn("tfo requested but not supported on this platform; relying on kernel-default TFO behavior if any")
+		} else {
+			if ok, why := tfoListenerReady(); !ok {
+				logger.Warn("tfo enabled in config but kernel listener support disabled", "reason", why)
+			} else {
+				logger.Info("tcp fast open enabled (listener)")
+			}
+			if ok, why := tfoDialerReady(); !ok {
+				logger.Warn("tfo enabled in config but kernel client support disabled", "reason", why)
+			} else {
+				logger.Info("tcp fast open enabled (upstream dialer)")
+			}
+		}
+	}
 	return s, nil
 }
 
-// dialer returns a net.Dialer configured with the server's dial timeout
-// and (optionally) bound to the configured egress interface.
+// chainListenControl combines multiple Control hooks into one. Each is
+// run in order; the first non-nil error stops the chain.
+func chainListenControl(fns ...func(string, string, syscall.RawConn) error) func(string, string, syscall.RawConn) error {
+	switch len(fns) {
+	case 0:
+		return nil
+	case 1:
+		return fns[0]
+	}
+	return func(network, addr string, c syscall.RawConn) error {
+		for _, fn := range fns {
+			if fn == nil {
+				continue
+			}
+			if err := fn(network, addr, c); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+// dialer returns a net.Dialer configured with the server's dial timeout,
+// optional egress-interface binding, and optional TFO connect.
 func (s *Server) dialer() net.Dialer {
 	d := net.Dialer{Timeout: s.cfg.DialTimeout}
+	var controls []func(string, string, syscall.RawConn) error
 	if s.cfg.EgressInterface != "" {
-		d.Control = bindEgressInterface(s.cfg.EgressInterface)
+		controls = append(controls, bindEgressInterface(s.cfg.EgressInterface))
+	}
+	if s.cfg.TFO {
+		controls = append(controls, applyTFODial)
+	}
+	if c := chainListenControl(controls...); c != nil {
+		d.Control = c
 	}
 	return d
 }
 
-// listenConfig returns a net.ListenConfig configured to bind outbound
-// listeners (i.e., the UDP socket used for UDP-over-TCP forwarding) to
-// the egress interface, when one is configured.
+// listenConfig returns a net.ListenConfig with optional egress-interface
+// binding and optional TFO listen.
+//
+// Note: egress-interface here applies to the UDP-over-TCP listener and
+// the QUIC mode listener (server's outbound-facing sockets); TFO applies
+// to TCP listeners only. applyTFOListen no-ops for non-tcp networks, so
+// it's safe to chain it on a ListenConfig that's reused for both.
 func (s *Server) listenConfig() net.ListenConfig {
 	lc := net.ListenConfig{}
+	var controls []func(string, string, syscall.RawConn) error
 	if s.cfg.EgressInterface != "" {
-		lc.Control = bindEgressInterface(s.cfg.EgressInterface)
+		controls = append(controls, bindEgressInterface(s.cfg.EgressInterface))
+	}
+	if s.cfg.TFO {
+		controls = append(controls, applyTFOListen)
+	}
+	if c := chainListenControl(controls...); c != nil {
+		lc.Control = c
 	}
 	return lc
 }
@@ -136,7 +207,7 @@ func (s *Server) outboundNetwork(base string) string {
 // QUIC proxy mode) and serves until ctx is cancelled or a listener fails
 // irrecoverably.
 func (s *Server) ListenAndServe(ctx context.Context) error {
-	lc := net.ListenConfig{}
+	lc := s.listenConfig()
 	ln, err := lc.Listen(ctx, "tcp", s.cfg.Listen)
 	if err != nil {
 		return err

@@ -40,6 +40,15 @@ type ClientConfig struct {
 	// up now so a future QUIC-mode implementation can switch on it
 	// without breaking config compatibility.
 	Version string
+
+	// TFO enables TCP Fast Open (RFC 7413) on outbound dials to the
+	// snell server. When the kernel cooperates, the snell CONNECT
+	// header rides along in the SYN packet, eliminating one round-trip
+	// per fresh upstream TCP. Matches Surge's per-proxy `tfo = true`.
+	//
+	// Linux only (uses TCP_FASTOPEN_CONNECT setsockopt). On other
+	// platforms the option is silently no-op. Off by default.
+	TFO bool
 }
 
 func (c ClientConfig) normalizedVersion() string {
@@ -93,6 +102,15 @@ func NewClient(cfg ClientConfig, logger *slog.Logger) (*Client, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if cfg.TFO {
+		if !tfoSupported() {
+			logger.Warn("tfo requested but not supported on this platform; relying on kernel-default TFO behavior if any")
+		} else if ok, why := tfoDialerReady(); !ok {
+			logger.Warn("tfo enabled in config but kernel client support disabled", "reason", why)
+		} else {
+			logger.Info("tcp fast open enabled (outbound dialer)")
+		}
+	}
 	logger.Info("snell client",
 		"server", cfg.Server,
 		"version", cfg.normalizedVersion(),
@@ -111,6 +129,9 @@ func NewClient(cfg ClientConfig, logger *slog.Logger) (*Client, error) {
 // CONNECT header written yet.
 func (c *Client) dialFresh(ctx context.Context) (*Snell, error) {
 	dialer := net.Dialer{Timeout: c.cfg.DialTimeout}
+	if c.cfg.TFO {
+		dialer.Control = applyTFODial
+	}
 	raw, err := dialer.DialContext(ctx, "tcp", c.cfg.Server)
 	if err != nil {
 		return nil, err

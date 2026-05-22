@@ -60,10 +60,19 @@ check_root() {
     fi
 }
 
+# This installer is Linux-only: it depends on systemd for service
+# management, iptables/UFW/firewalld for the port hole-punch, and
+# /etc/sysctl.conf for TFO. Anything else is out of scope — call out
+# the alternatives early instead of failing halfway through.
 check_linux() {
     if [ "$(uname -s)" != "Linux" ]; then
-        print_error "This installer targets Linux only (systemd-based)."
-        print_info "On other platforms, build from source: go install github.com/missuo/opensnell/cmd/snell-server@latest"
+        print_error "This installer is Linux-only."
+        print_info  "Detected OS: $(uname -s) — not supported."
+        print_info  "On macOS / Windows / *BSD, build from source instead:"
+        print_info  "    go install github.com/missuo/opensnell/cmd/snell-server@latest"
+        print_info  "and configure / supervise it with your platform's native tooling"
+        print_info  "(launchd, NSSM, rc.d, etc.). The OpenSnell server itself is"
+        print_info  "cross-platform; only this installer is Linux-specific."
         exit 1
     fi
 }
@@ -133,6 +142,51 @@ get_ipv4() {
         || curl -s -4 --max-time 5 ip.sb 2>/dev/null \
         || curl -s -4 --max-time 5 ipinfo.io/ip 2>/dev/null \
         || echo "YOUR_SERVER_IP"
+}
+
+# Make sure the kernel has TFO fully enabled (bit 0 + bit 1 = 3).
+# If the running kernel already reports 3, we DON'T touch the user's
+# system — we only write `tfo = true` to opensnell.conf and trust the
+# kernel. We only edit /etc/sysctl.conf when the kernel is missing one
+# of the bits, and even then we keep the edit minimal (sed-or-append).
+enable_tfo_sysctl() {
+    local current
+    current=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "")
+
+    if [ "$current" = "3" ]; then
+        print_info "Kernel net.ipv4.tcp_fastopen=3 already; no system changes needed"
+        return 0
+    fi
+
+    print_warning "Kernel net.ipv4.tcp_fastopen=${current:-unknown} (TFO needs 3)"
+    local confirm
+    confirm=$(prompt_yesno "Set it to 3 (will write to /etc/sysctl.conf and apply via sysctl -p)" "y")
+    if [ "$confirm" != "y" ]; then
+        print_warning "Skipping; OpenSnell will still set the socket option, but TFO won't actually take effect"
+        return 0
+    fi
+
+    local sysctl_conf="/etc/sysctl.conf"
+    local setting="net.ipv4.tcp_fastopen = 3"
+    if [ -f "$sysctl_conf" ] && grep -qE '^[[:space:]]*net\.ipv4\.tcp_fastopen' "$sysctl_conf"; then
+        sed -i "s|^[[:space:]]*net\.ipv4\.tcp_fastopen.*|$setting|" "$sysctl_conf"
+        print_success "Updated existing entry in $sysctl_conf"
+    else
+        echo "$setting" >> "$sysctl_conf"
+        print_success "Appended to $sysctl_conf"
+    fi
+
+    if sysctl -p >/dev/null 2>&1; then
+        local after
+        after=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo "?")
+        if [ "$after" = "3" ]; then
+            print_success "Kernel now reports net.ipv4.tcp_fastopen=3"
+        else
+            print_warning "sysctl -p ran but kernel reports tcp_fastopen=$after (expected 3)"
+        fi
+    else
+        print_warning "sysctl -p failed; reboot or run it manually to apply"
+    fi
 }
 
 get_installed_version() {
@@ -272,9 +326,9 @@ build_config() {
     if [ "$ipv6_choice" = "y" ]; then ipv6="true"; else ipv6="false"; fi
 
     # OpenSnell-only knobs
-    local udp="true" quic="true" egress=""
+    local udp="true" quic="true" egress="" tfo="false"
     if [ "$variant" = "opensnell" ]; then
-        local udp_choice quic_choice
+        local udp_choice quic_choice tfo_choice
         udp_choice=$(prompt_yesno "Accept UDP-over-TCP (snell datagram protocol)" "y")
         [ "$udp_choice" = "n" ] && udp="false"
 
@@ -282,6 +336,9 @@ build_config() {
         [ "$quic_choice" = "n" ] && quic="false"
 
         egress=$(prompt_default "Egress interface to pin upstream sockets to (leave blank for default route)" "")
+
+        tfo_choice=$(prompt_yesno "Enable TCP Fast Open (saves 1 RTT per fresh connection; Linux only)" "n")
+        [ "$tfo_choice" = "y" ] && tfo="true"
     fi
 
     # --- Write config ---
@@ -297,7 +354,14 @@ EOF
 udp = ${udp}
 quic = ${quic}
 egress-interface = ${egress}
+tfo = ${tfo}
 EOF
+    fi
+
+    # Surge has its own per-proxy tfo=true, which our snell-server happily
+    # ignores when running as the Surge variant. So TFO config is OpenSnell-only.
+    if [ "$variant" = "opensnell" ] && [ "$tfo" = "true" ]; then
+        enable_tfo_sysctl
     fi
     chmod 600 "$CONFIG_FILE"
     print_success "Configuration written to $CONFIG_FILE"
@@ -417,7 +481,7 @@ show_info() {
 # Top-level actions
 # ============================================================================
 do_install() {
-    check_root; check_linux; ensure_tools
+    check_root; ensure_tools
 
     print_header "OpenSnell server installer"
     echo -e "${BOLD}Choose a variant:${NC}"
@@ -446,7 +510,7 @@ do_install() {
 }
 
 do_reconfigure() {
-    check_root; check_linux
+    check_root
     [ -f "$INSTALL_BIN" ] || { print_error "Binary not found; install first."; exit 1; }
     build_config
     write_systemd_unit
@@ -456,7 +520,7 @@ do_reconfigure() {
 }
 
 do_update() {
-    check_root; check_linux; ensure_tools
+    check_root; ensure_tools
     local variant; variant=$(get_install_variant)
     [ -z "$variant" ] && variant="opensnell"
     print_info "Updating variant: $variant"
@@ -555,6 +619,14 @@ show_menu() {
 }
 
 main() {
+    # `help` is the only subcommand that should work anywhere; everything
+    # else needs systemd / iptables / sysctl etc., so refuse non-Linux
+    # immediately rather than fail halfway through.
+    case "${1:-}" in
+        help|--help|-h) show_help; return ;;
+    esac
+    check_linux
+
     case "${1:-}" in
         install)        do_install        ;;
         reconfigure)    do_reconfigure    ;;
@@ -567,7 +639,6 @@ main() {
         disable)        check_root; disable_service   ;;
         status)         status_service                ;;
         info)           show_info                     ;;
-        help|--help|-h) show_help                     ;;
         "")             show_menu                     ;;
         *)              print_error "Unknown command: $1"; show_help; exit 1 ;;
     esac

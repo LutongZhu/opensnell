@@ -80,6 +80,7 @@ func loadClientConfig(path string) (clientFileConfig, error) {
 			ObfsHost: sec.Key("obfs-host").MustString(""),
 			Reuse:    sec.Key("reuse").MustBool(false),
 			Version:  sec.Key("version").MustString(""),
+			TFO:      sec.Key("tfo").MustBool(false),
 		},
 	}
 	return out, nil

@@ -39,6 +39,7 @@ the current Surge `snell-server` speaks.
 | Dynamic Record Sizing (v5)            | ✅             | ✅             |
 | `egress-interface` (v5)               | ✅             | —              |
 | `ipv6` outbound family toggle (v5)    | ✅             | —              |
+| TCP Fast Open (Linux only)            | ✅             | ✅             |
 | **QUIC proxy mode (v5)**              | ✅             | use Surge      |
 
 ## Install
@@ -128,6 +129,16 @@ egress-interface =
 ; outbound; what addresses the server LISTENS on is still controlled
 ; by `listen` (write `[::]:2333` for v6 dual-stack inbound).
 ipv6 = true
+
+; TCP Fast Open (RFC 7413). Optional, default false. When enabled,
+; both the inbound TCP listener and outbound upstream TCP dials get
+; TFO setsockopt, allowing the snell client's first data write to
+; ride along in the SYN packet — saving one RTT per fresh TCP
+; connection. Linux only (uses TCP_FASTOPEN / TCP_FASTOPEN_CONNECT).
+; Requires the kernel sysctl `net.ipv4.tcp_fastopen` to have bit 1
+; set for server (run `sysctl -w net.ipv4.tcp_fastopen=3`). On other
+; platforms this option is a silent no-op.
+tfo = false
 ```
 
 Run:
@@ -197,6 +208,11 @@ obfs-host = bing.com
 ; half-close zero chunk before putting a connection back so the next
 ; reuse starts on a clean frame boundary.
 reuse = true
+
+; TCP Fast Open on outbound dials to the snell server. Optional,
+; default false. Linux only — see the server-side `tfo` notes above
+; for the kernel sysctl requirements.
+tfo = false
 ```
 
 Run:
