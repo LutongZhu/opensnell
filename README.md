@@ -29,6 +29,8 @@ listen = 0.0.0.0:8388
 psk    = your-shared-secret
 obfs   = off          ; off | http | tls
 udp    = true
+egress-interface =    ; optional: bind upstream sockets to this interface
+                      ; (Linux: SO_BINDTODEVICE; macOS: IP_BOUND_IF)
 ```
 
 ```ini
@@ -70,17 +72,22 @@ Tested against `snell-server v5.0.1 (Nov 19 2025)`:
 | Client → real server, UDP-over-TCP | ✅ DNS round-tripped                  |
 | Client → real server, **reuse**    | ✅ 10/10 after fixing two reuse bugs (see below) |
 
-### v5-specific server features we don't (yet) implement
+### v5-specific server features status
 
-- **QUIC proxy mode** — v5.0.0 added a UDP-over-UDP forwarding mode for
-  QUIC traffic with strongly-encrypted handshake packets. Not implemented;
-  our server only serves the TCP and UDP-over-TCP paths.
-- **Dynamic Record Sizing** — v5.0.0 highlights this as a TLS-over-TCP
-  latency optimization à la Cloudflare. Our v4Writer already does the
-  start-small-then-ramp framing (`nextPayloadLimit`), so we're effectively
-  on parity for this point.
-- **Egress interface / network namespace selection** (`egress-interface`)
-  — not implemented; not relevant to our use case.
+- **Dynamic Record Sizing** — ✅ on parity. Our `v4Writer.nextPayloadLimit`
+  starts the first frame small (so the salt + initial padding + payload
+  fit in a single MTU) and ramps frame size up over the burst, then
+  resets after a 30 s idle window.
+- **`egress-interface`** — ✅ implemented. Set
+  `egress-interface = <name>` in `snell-server.conf` to pin upstream
+  TCP dials and the UDP-over-TCP listener to a specific local interface.
+  Uses `SO_BINDTODEVICE` on Linux and `IP_BOUND_IF` / `IPV6_BOUND_IF`
+  on macOS; other platforms surface a runtime error.
+- **QUIC proxy mode** — ❌ not implemented. v5.0.0's
+  UDP-over-UDP forwarding mode with strongly-encrypted handshake
+  packets is a separate protocol with no public spec. Requires
+  reverse-engineering against a real Surge client; deferred until we
+  have packet captures.
 
 ### What the reuse fix looked like
 

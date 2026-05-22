@@ -32,6 +32,15 @@ type ServerConfig struct {
 	ObfsMode string // "", "off", "http", "tls"
 	UDP      bool   // accept UDP-over-TCP requests
 	DialTimeout time.Duration
+
+	// EgressInterface, when non-empty, forces all outbound sockets
+	// (upstream TCP dials and UDP-over-TCP listeners) to be bound to the
+	// named local interface. Useful when the server host has multiple
+	// network paths and you want to pin egress to a specific one.
+	//
+	// Implemented via SO_BINDTODEVICE on Linux and IP_BOUND_IF on macOS.
+	// Other platforms return an error if this field is set.
+	EgressInterface string
 }
 
 // Server is a snell v4/v5 server. Use NewServer + Serve, or pass an
@@ -58,7 +67,32 @@ func NewServer(cfg ServerConfig, logger *slog.Logger) (*Server, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{cfg: cfg, psk: []byte(cfg.PSK), logger: logger}, nil
+	s := &Server{cfg: cfg, psk: []byte(cfg.PSK), logger: logger}
+	if cfg.EgressInterface != "" {
+		logger.Info("egress interface", "name", cfg.EgressInterface)
+	}
+	return s, nil
+}
+
+// dialer returns a net.Dialer configured with the server's dial timeout
+// and (optionally) bound to the configured egress interface.
+func (s *Server) dialer() net.Dialer {
+	d := net.Dialer{Timeout: s.cfg.DialTimeout}
+	if s.cfg.EgressInterface != "" {
+		d.Control = bindEgressInterface(s.cfg.EgressInterface)
+	}
+	return d
+}
+
+// listenConfig returns a net.ListenConfig configured to bind outbound
+// listeners (i.e., the UDP socket used for UDP-over-TCP forwarding) to
+// the egress interface, when one is configured.
+func (s *Server) listenConfig() net.ListenConfig {
+	lc := net.ListenConfig{}
+	if s.cfg.EgressInterface != "" {
+		lc.Control = bindEgressInterface(s.cfg.EgressInterface)
+	}
+	return lc
 }
 
 // ListenAndServe binds the configured address and serves until ctx is
@@ -204,9 +238,10 @@ func (s *Server) handleTCP(ctx context.Context, stream *Snell, br *bufio.Reader,
 		"reuse", reuse,
 	)
 
-	dialer := net.Dialer{Timeout: s.cfg.DialTimeout}
+	dialer := s.dialer()
 	upstream, derr := dialer.DialContext(ctx, "tcp", target)
 	if derr != nil {
+		s.logger.Warn("upstream dial failed", "target", target, "err", derr)
 		if werr := writeServerError(stream, errnoOf(derr), derr.Error()); werr != nil {
 			return false, werr
 		}
@@ -354,7 +389,8 @@ func (s *Server) handleUDP(ctx context.Context, stream *Snell) error {
 		return err
 	}
 
-	pc, err := net.ListenPacket("udp", ":0")
+	lc := s.listenConfig()
+	pc, err := lc.ListenPacket(ctx, "udp", ":0")
 	if err != nil {
 		return writeServerError(stream, errnoOf(err), err.Error())
 	}
