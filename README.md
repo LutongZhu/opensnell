@@ -63,6 +63,53 @@ The interactive installer:
 - Re-run with `reconfigure`, `update`, `uninstall`, `start`, `stop`,
   `restart`, `status`, or `info` — see `./install.sh help`.
 
+### Docker / Docker Compose
+
+The server image is published to GHCR as
+`ghcr.io/missuo/opensnell-server` (multi-arch: `linux/amd64` and
+`linux/arm64`). All configuration is supplied via environment variables
+— the entrypoint materializes `snell-server.conf` from them at start.
+If `SNELL_PSK` is left blank, a random PSK is generated and printed to
+the container logs on first start.
+
+```yaml
+# compose.yaml
+services:
+  snell-server:
+    image: ghcr.io/missuo/opensnell-server:latest
+    container_name: snell-server
+    restart: unless-stopped
+    ports:
+      - "2333:2333/tcp"
+      - "2333:2333/udp"
+    environment:
+      SNELL_LISTEN: "0.0.0.0:2333"
+      SNELL_PSK: ""           # leave blank to auto-generate
+      SNELL_OBFS: "off"
+      SNELL_UDP: "true"
+      SNELL_QUIC: "true"
+      SNELL_IPV6: "true"
+      SNELL_TFO: "false"
+      # SNELL_EGRESS_INTERFACE: "eth0"
+      # SNELL_DNS: "1.1.1.1, 8.8.8.8"
+```
+
+```sh
+docker compose up -d
+docker compose logs snell-server   # grab the generated PSK if you left it blank
+```
+
+Or with plain `docker run`:
+
+```sh
+docker run -d --name snell-server --restart unless-stopped \
+  -p 2333:2333/tcp -p 2333:2333/udp \
+  -e SNELL_PSK=your-shared-secret \
+  ghcr.io/missuo/opensnell-server:latest
+```
+
+Tagged releases are available as `:1.0.3`, `:1.0`, `:1`, etc.
+
 ### Build from source
 
 ```sh

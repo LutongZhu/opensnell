@@ -60,6 +60,51 @@ bash <(curl -fsSL https://s.ee/opensnell)
 - 再次运行时可使用 `reconfigure`、`update`、`uninstall`、`start`、`stop`、
   `restart`、`status` 或 `info`；详见 `./install.sh help`。
 
+### Docker / Docker Compose
+
+服务端镜像发布在 GHCR：`ghcr.io/missuo/opensnell-server`
+（多架构：`linux/amd64` 与 `linux/arm64`）。所有配置都通过环境变量传入，
+入口脚本会在启动时将其渲染为 `snell-server.conf`。如果 `SNELL_PSK`
+留空，容器首次启动时会自动生成随机 PSK 并打印到日志。
+
+```yaml
+# compose.yaml
+services:
+  snell-server:
+    image: ghcr.io/missuo/opensnell-server:latest
+    container_name: snell-server
+    restart: unless-stopped
+    ports:
+      - "2333:2333/tcp"
+      - "2333:2333/udp"
+    environment:
+      SNELL_LISTEN: "0.0.0.0:2333"
+      SNELL_PSK: ""           # 留空则自动生成
+      SNELL_OBFS: "off"
+      SNELL_UDP: "true"
+      SNELL_QUIC: "true"
+      SNELL_IPV6: "true"
+      SNELL_TFO: "false"
+      # SNELL_EGRESS_INTERFACE: "eth0"
+      # SNELL_DNS: "1.1.1.1, 8.8.8.8"
+```
+
+```sh
+docker compose up -d
+docker compose logs snell-server   # 留空 PSK 时，从日志里取自动生成的值
+```
+
+也可以直接用 `docker run`：
+
+```sh
+docker run -d --name snell-server --restart unless-stopped \
+  -p 2333:2333/tcp -p 2333:2333/udp \
+  -e SNELL_PSK=your-shared-secret \
+  ghcr.io/missuo/opensnell-server:latest
+```
+
+带 tag 的版本可以使用 `:1.0.3`、`:1.0`、`:1` 等。
+
 ### 从源码构建
 
 ```sh
