@@ -53,8 +53,14 @@ bash <(curl -fsSL https://s.ee/opensnell)
 
 The interactive installer:
 
-- Lets you pick between **OpenSnell** (default, GPLv3, all-platform) or
-  the **official Surge `snell-server v5.0.1`** (closed-source, Linux only).
+- Lets you pick between **OpenSnell** (default, GPLv3, all-platform), the
+  **official Surge `snell-server v5.0.1`**, or the **official Surge
+  `snell-server v6.0.0b1`** beta (both closed-source, Linux only).
+- For the v6 variant it writes the new v6-style config (`dns-ip-preference`
+  replaces `ipv6`; `obfs` is gone), auto-installs the shared libraries the
+  dynamically-linked v6 binary needs (`libc-ares`, `libuv`, `libsodium`, and
+  OpenSSL 1.1 — pulled from the Debian 11 archive on distros that no longer
+  package it), and emits `version=6` client lines.
 - Generates a random PSK with `openssl` if you leave it blank.
 - Picks an unused random port in `10000–60000` if you leave the port blank.
 - Writes `/etc/snell/snell-server.conf`, installs a systemd unit

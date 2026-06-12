@@ -50,8 +50,14 @@ bash <(curl -fsSL https://s.ee/opensnell)
 
 交互式安装器会：
 
-- 让你选择 **OpenSnell**（默认，GPLv3，支持所有平台）或
-  **官方 Surge `snell-server v5.0.1`**（闭源，仅 Linux）。
+- 让你选择 **OpenSnell**（默认，GPLv3，支持所有平台）、
+  **官方 Surge `snell-server v5.0.1`** 或 **官方 Surge
+  `snell-server v6.0.0b1`** beta（均为闭源，仅 Linux）。
+- 选择 v6 时会写入新版 v6 配置（`dns-ip-preference` 取代 `ipv6`，
+  `obfs` 已移除），并自动安装 v6 动态链接二进制所需的共享库
+  （`libc-ares`、`libuv`、`libsodium` 以及 OpenSSL 1.1 —— 在已不再
+  提供该版本的发行版上会从 Debian 11 归档拉取），客户端配置行输出
+  `version=6`。
 - 如果 PSK 留空，使用 `openssl` 自动生成随机 PSK。
 - 如果端口留空，在 `10000–60000` 范围内随机选择一个未占用端口。
 - 写入 `/etc/snell/snell-server.conf`，安装 systemd unit

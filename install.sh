@@ -13,9 +13,11 @@
 #
 # Without arguments, an interactive menu is shown.
 #
-# Two install variants:
+# Three install variants:
 #   1) OpenSnell (default, GPLv3, all-platform, this repo)
 #   2) Surge official snell-server v5.0.1 (closed-source, Linux only)
+#   3) Surge official snell-server v6.0.0b1 (closed-source beta, Linux only,
+#      protocol v6; needs extra shared libraries — see ensure_v6_runtime_libs)
 #
 # Project: https://github.com/missuo/opensnell
 # SPDX-License-Identifier: GPL-3.0-or-later
@@ -47,7 +49,8 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
 OPENSNELL_REPO="missuo/opensnell"
 OPENSNELL_RELEASE_API="https://api.github.com/repos/${OPENSNELL_REPO}/releases/latest"
-SURGE_VERSION="v5.0.1"
+SURGE_V5_VERSION="v5.0.1"
+SURGE_V6_VERSION="v6.0.0b1"
 SURGE_BASE_URL="https://dl.nssurge.com/snell"
 
 # ============================================================================
@@ -352,18 +355,29 @@ download_opensnell() {
 
     echo "variant=opensnell" >  "$META_FILE.tmp"
     echo "version=$tag"      >> "$META_FILE.tmp"
+    echo "proto=5"           >> "$META_FILE.tmp"
 }
 
 download_surge() {
+    # download_surge <version>, e.g. "v5.0.1" or "v6.0.0b1".
+    local version="$1" proto="5"
+    case "$version" in v6*) proto="6" ;; esac
+
     print_header "Downloading Surge official snell-server"
     mkdir -p "$CONFIG_DIR"
     local arch url workdir
     arch=$(detect_arch_surge)
-    url="${SURGE_BASE_URL}/snell-server-${SURGE_VERSION}-linux-${arch}.zip"
+    # v6 dropped the armv7l build; only amd64 / i386 / aarch64 are published.
+    if [ "$proto" = "6" ] && [ "$arch" = "armv7l" ]; then
+        print_error "Surge snell-server ${version} is not available for armv7l."
+        print_info  "Choose the v5 variant or the OpenSnell variant instead."
+        exit 1
+    fi
+    url="${SURGE_BASE_URL}/snell-server-${version}-linux-${arch}.zip"
 
     print_info "Variant:      Surge official (closed-source, Linux only)"
     print_info "Architecture: linux/${arch}"
-    print_info "Version:      ${SURGE_VERSION}"
+    print_info "Version:      ${version}"
     print_info "Source:       ${url}"
     print_warning "By proceeding you accept Surge's license terms."
 
@@ -377,10 +391,97 @@ download_surge() {
     unzip -q "$workdir/snell.zip" -d "$workdir"
     install -m 0755 "$workdir/snell-server" "$INSTALL_BIN"
     rm -rf "$workdir"
-    print_success "Installed Surge snell-server ${SURGE_VERSION} → ${INSTALL_BIN}"
+    print_success "Installed Surge snell-server ${version} → ${INSTALL_BIN}"
 
-    echo "variant=surge"             >  "$META_FILE.tmp"
-    echo "version=${SURGE_VERSION}"  >> "$META_FILE.tmp"
+    if [ "$proto" = "6" ]; then
+        ensure_v6_runtime_libs
+        # The v6 binary is UPX-packed, so ldd can't enumerate its needs;
+        # the only reliable check is to actually execute it.
+        if "$INSTALL_BIN" -v >/dev/null 2>&1; then
+            print_success "Binary runs OK ($("$INSTALL_BIN" -v 2>&1 | grep -o 'snell-server v[^ ]*'))"
+        else
+            print_error "snell-server ${version} fails to start — likely missing shared libraries."
+            print_info  "Run '$INSTALL_BIN -v' to see which library is missing, install it, then re-run."
+            exit 1
+        fi
+    fi
+
+    echo "variant=surge"       >  "$META_FILE.tmp"
+    echo "version=${version}"  >> "$META_FILE.tmp"
+    echo "proto=${proto}"      >> "$META_FILE.tmp"
+}
+
+# ============================================================================
+# v6 runtime dependencies
+# ============================================================================
+# Unlike the fully static v5 build, the Surge v6 binaries are dynamically
+# linked: they need libcares.so.2, libuv.so.1, libsodium.so.23 and — the
+# awkward one — libcrypto.so.1.1 (OpenSSL 1.1), which Debian 12+/Ubuntu 22+
+# no longer package. On apt systems we fall back to the libssl1.1 package
+# from the Debian 11 (bullseye) security archive.
+have_lib() { ldconfig -p 2>/dev/null | grep -q "$1"; }
+
+install_libssl11_deb() {
+    local deb_arch pool deb tmp
+    case "$(uname -m)" in
+        x86_64)        deb_arch="amd64" ;;
+        aarch64|arm64) deb_arch="arm64" ;;
+        i386|i686)     deb_arch="i386"  ;;
+        *) print_error "No libssl1.1 fallback package for $(uname -m)."; return 1 ;;
+    esac
+    pool="http://security.debian.org/debian-security/pool/updates/main/o/openssl"
+    # Scrape the pool index instead of pinning a filename, so new +deb11uN
+    # security revisions don't break us.
+    deb=$(curl -fsSL "$pool/" | grep -oE "libssl1\.1_[^\"]+_${deb_arch}\.deb" | sort -uV | tail -1)
+    if [ -z "$deb" ]; then
+        print_error "Could not locate a libssl1.1 package in the Debian archive."
+        return 1
+    fi
+    print_info "Installing OpenSSL 1.1 from Debian archive: $deb"
+    tmp=$(mktemp)
+    if curl -fsSL -o "$tmp" "$pool/$deb" && dpkg -i "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        return 0
+    fi
+    rm -f "$tmp"
+    print_error "Failed to install $deb"
+    return 1
+}
+
+ensure_v6_runtime_libs() {
+    print_info "Checking shared-library dependencies for snell-server v6..."
+    if command -v apt-get >/dev/null 2>&1; then
+        local pkgs=()
+        have_lib libcares.so.2   || pkgs+=(libc-ares2)
+        have_lib libuv.so.1      || pkgs+=(libuv1)
+        have_lib libsodium.so.23 || pkgs+=(libsodium23)
+        if [ "${#pkgs[@]}" -gt 0 ]; then
+            print_info "Installing: ${pkgs[*]}"
+            apt-get update -qq
+            apt-get install -y "${pkgs[@]}" >/dev/null 2>&1 \
+                || print_warning "apt-get install failed for: ${pkgs[*]}"
+        fi
+        if ! have_lib libcrypto.so.1.1; then
+            # Present natively only on Debian 11 / Ubuntu 20.04 and older.
+            apt-get install -y libssl1.1 >/dev/null 2>&1 || install_libssl11_deb \
+                || print_warning "Could not provide libcrypto.so.1.1; the binary check below will fail."
+        fi
+    elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+        local mgr="yum"; command -v dnf >/dev/null 2>&1 && mgr="dnf"
+        local pkgs=()
+        have_lib libcares.so.2   || pkgs+=(c-ares)
+        have_lib libuv.so.1      || pkgs+=(libuv)
+        have_lib libsodium.so.23 || pkgs+=(libsodium)
+        have_lib libcrypto.so.1.1 || pkgs+=(compat-openssl11)
+        if [ "${#pkgs[@]}" -gt 0 ]; then
+            print_info "Installing: ${pkgs[*]}"
+            "$mgr" install -y "${pkgs[@]}" >/dev/null 2>&1 \
+                || print_warning "$mgr install failed for: ${pkgs[*]}"
+        fi
+    else
+        print_warning "Unknown package manager; ensure these libraries exist:"
+        print_warning "  libcares.so.2, libuv.so.1, libsodium.so.23, libcrypto.so.1.1 (OpenSSL 1.1)"
+    fi
 }
 
 # ============================================================================
@@ -390,13 +491,16 @@ build_config() {
     # Prefer the variant set during the immediately-preceding download (we
     # haven't committed META_FILE yet), or fall back to existing meta on
     # reconfigure.
-    local variant=""
+    local variant="" proto=""
     if [ -f "$META_FILE.tmp" ]; then
         variant=$(grep '^variant=' "$META_FILE.tmp" | cut -d= -f2)
+        proto=$(grep '^proto='     "$META_FILE.tmp" | cut -d= -f2)
     elif [ -f "$META_FILE" ]; then
         variant=$(grep '^variant=' "$META_FILE" | cut -d= -f2)
+        proto=$(grep '^proto='     "$META_FILE" | cut -d= -f2)
     fi
     variant="${variant:-opensnell}"
+    proto="${proto:-5}"
 
     print_header "Snell server configuration"
     mkdir -p "$CONFIG_DIR"
@@ -416,16 +520,39 @@ build_config() {
         psk=$(gen_psk)
         print_info "Generated PSK: ${BOLD}${psk}${NC}"
     fi
+    # The v6 server hard-rejects PSKs outside 16..255 bytes at startup,
+    # so catch it here instead of leaving a service that won't boot.
+    if [ "$proto" = "6" ]; then
+        local psk_len; psk_len=$(printf '%s' "$psk" | wc -c | tr -d ' ')
+        if [ "$psk_len" -lt 16 ] || [ "$psk_len" -gt 255 ]; then
+            print_error "snell v6 requires a PSK between 16 and 255 bytes (got ${psk_len})."
+            exit 1
+        fi
+    fi
 
-    # --- obfs ---
-    local obfs
-    obfs=$(prompt_default "obfs mode (off/http/tls)" "off")
-    case "$obfs" in off|http|tls) ;; *) print_error "obfs must be one of: off, http, tls"; exit 1 ;; esac
+    # --- obfs (removed in v6; the v6 server silently ignores it) ---
+    local obfs="off"
+    if [ "$proto" != "6" ]; then
+        obfs=$(prompt_default "obfs mode (off/http/tls)" "off")
+        case "$obfs" in off|http|tls) ;; *) print_error "obfs must be one of: off, http, tls"; exit 1 ;; esac
+    fi
 
-    # --- ipv6 ---
-    local ipv6_choice ipv6
-    ipv6_choice=$(prompt_yesno "Allow IPv6 destinations (server-side outbound)" "y")
-    if [ "$ipv6_choice" = "y" ]; then ipv6="true"; else ipv6="false"; fi
+    # --- ipv6 / DNS preference ---
+    # v6 deprecates `ipv6 = true/false` in favour of dns-ip-preference
+    # (default / prefer-ipv4 / prefer-ipv6 / ipv4-only / ipv6-only).
+    local ipv6_choice ipv6="true" dns_pref="" dns_servers=""
+    if [ "$proto" = "6" ]; then
+        dns_pref=$(prompt_default "DNS IP preference (default/prefer-ipv4/prefer-ipv6/ipv4-only/ipv6-only)" "default")
+        case "$dns_pref" in
+            default|prefer-ipv4|prefer-ipv6|ipv4-only|ipv6-only) ;;
+            *) print_error "Invalid DNS IP preference: $dns_pref"; exit 1 ;;
+        esac
+        [ "$dns_pref" = "ipv4-only" ] && ipv6="false"
+        dns_servers=$(prompt_default "Custom DNS servers, comma-separated (leave blank for system default)" "")
+    else
+        ipv6_choice=$(prompt_yesno "Allow IPv6 destinations (server-side outbound)" "y")
+        if [ "$ipv6_choice" = "y" ]; then ipv6="true"; else ipv6="false"; fi
+    fi
 
     # OpenSnell-only knobs
     local udp="true" quic="true" egress="" tfo="false"
@@ -441,23 +568,39 @@ build_config() {
 
         tfo_choice=$(prompt_yesno "Enable TCP Fast Open (saves 1 RTT per fresh connection; Linux only)" "n")
         [ "$tfo_choice" = "y" ] && tfo="true"
+    elif [ "$proto" = "6" ]; then
+        # The official v6 server grew its own egress-interface directive.
+        egress=$(prompt_default "Egress interface to pin upstream sockets to (leave blank for default route)" "")
     fi
 
     # --- Write config ---
-    cat > "$CONFIG_FILE" <<EOF
+    if [ "$proto" = "6" ]; then
+        # Canonical v6 layout (what `snell-server --wizard` generates):
+        # obfs is gone and ipv6 is deprecated, replaced by dns-ip-preference.
+        cat > "$CONFIG_FILE" <<EOF
+[snell-server]
+listen = 0.0.0.0:${port}
+psk = ${psk}
+dns-ip-preference = ${dns_pref}
+EOF
+        [ -n "$dns_servers" ] && echo "dns = ${dns_servers}"        >> "$CONFIG_FILE"
+        [ -n "$egress" ]      && echo "egress-interface = ${egress}" >> "$CONFIG_FILE"
+    else
+        cat > "$CONFIG_FILE" <<EOF
 [snell-server]
 listen = 0.0.0.0:${port}
 psk = ${psk}
 obfs = ${obfs}
 ipv6 = ${ipv6}
 EOF
-    if [ "$variant" = "opensnell" ]; then
-        cat >> "$CONFIG_FILE" <<EOF
+        if [ "$variant" = "opensnell" ]; then
+            cat >> "$CONFIG_FILE" <<EOF
 udp = ${udp}
 quic = ${quic}
 egress-interface = ${egress}
 tfo = ${tfo}
 EOF
+        fi
     fi
 
     # Surge has its own per-proxy tfo=true, which our snell-server happily
@@ -481,12 +624,13 @@ EOF
     # --- Persist meta ---
     if [ -f "$META_FILE.tmp" ]; then mv "$META_FILE.tmp" "$META_FILE"; fi
     {
-        grep -vE '^(port|psk|obfs|ipv6|tfo|node_name|geo_ip|geo_country)=' "$META_FILE" 2>/dev/null || true
+        grep -vE '^(port|psk|obfs|ipv6|tfo|dns_pref|node_name|geo_ip|geo_country)=' "$META_FILE" 2>/dev/null || true
         echo "port=$port"
         echo "psk=$psk"
         echo "obfs=$obfs"
         echo "ipv6=$ipv6"
         echo "tfo=$tfo"
+        echo "dns_pref=$dns_pref"
         echo "node_name=$node_name"
         echo "geo_ip=$GEO_IP"
         echo "geo_country=$GEO_COUNTRY"
@@ -564,16 +708,21 @@ show_info() {
         print_warning "No installation metadata found; is the server installed?"
         return 1
     fi
-    local variant version port psk obfs ipv6 tfo node_name geo_ip ip
+    local variant version proto port psk obfs ipv6 tfo dns_pref node_name geo_ip ip
     variant=$(grep   '^variant='     "$META_FILE" | cut -d= -f2-)
     version=$(grep   '^version='     "$META_FILE" | cut -d= -f2-)
+    proto=$(grep     '^proto='       "$META_FILE" | cut -d= -f2-)
     port=$(grep      '^port='        "$META_FILE" | cut -d= -f2-)
     psk=$(grep       '^psk='         "$META_FILE" | cut -d= -f2-)
     obfs=$(grep      '^obfs='        "$META_FILE" | cut -d= -f2-)
     ipv6=$(grep      '^ipv6='        "$META_FILE" | cut -d= -f2-)
     tfo=$(grep       '^tfo='         "$META_FILE" | cut -d= -f2-)
+    dns_pref=$(grep  '^dns_pref='    "$META_FILE" | cut -d= -f2-)
     node_name=$(grep '^node_name='   "$META_FILE" | cut -d= -f2-)
     geo_ip=$(grep    '^geo_ip='      "$META_FILE" | cut -d= -f2-)
+    # Installs made before v6 support never wrote a proto line; they are
+    # all protocol v5.
+    proto="${proto:-5}"
 
     # Prefer the IP we resolved at install time; if that wasn't captured
     # (e.g. ip.sb was down then), try again now, and last-ditch fall back
@@ -595,11 +744,16 @@ show_info() {
     echo -e "${BOLD}Node name:${NC}    ${node_name}"
     echo -e "${BOLD}Variant:${NC}      ${variant} (${version})"
     echo -e "${BOLD}Server IP:${NC}    ${ip}"
+    echo -e "${BOLD}Protocol:${NC}     v${proto}"
     echo -e "${BOLD}Port:${NC}         ${port}"
     echo -e "${BOLD}PSK:${NC}          ${psk}"
-    echo -e "${BOLD}obfs:${NC}         ${obfs}"
-    echo -e "${BOLD}IPv6 egress:${NC}  ${ipv6}"
-    echo -e "${BOLD}TFO:${NC}          ${tfo}"
+    if [ "$proto" = "6" ]; then
+        echo -e "${BOLD}DNS pref:${NC}     ${dns_pref:-default}"
+    else
+        echo -e "${BOLD}obfs:${NC}         ${obfs}"
+        echo -e "${BOLD}IPv6 egress:${NC}  ${ipv6}"
+        echo -e "${BOLD}TFO:${NC}          ${tfo}"
+    fi
 
     # Surge proxy line. We deliberately omit `block-quic` (it's `auto`
     # by default on the Surge side, which is what we want) and only
@@ -607,23 +761,23 @@ show_info() {
     print_header "Surge proxy line (copy into your Surge [Proxy] section)"
     local tfo_param=""
     [ "$tfo" = "true" ] && tfo_param=", tfo=true"
-    echo -e "${GREEN}${node_name} = snell, ${ip}, ${port}, psk=\"${psk}\", version=5${tfo_param}${NC}"
+    echo -e "${GREEN}${node_name} = snell, ${ip}, ${port}, psk=\"${psk}\", version=${proto}${tfo_param}${NC}"
 
     print_header "Mihomo proxy (copy into proxies)"
     local mihomo_name mihomo_server mihomo_psk
     mihomo_name=$(yaml_double_quote_escape "$node_name")
     mihomo_server=$(yaml_double_quote_escape "$ip")
     mihomo_psk=$(yaml_double_quote_escape "$psk")
-    printf '%b- {name: "%s", server: "%s", port: %s, type: snell, psk: "%s", version: 5}%b\n' \
-        "$GREEN" "$mihomo_name" "$mihomo_server" "$port" "$mihomo_psk" "$NC"
+    printf '%b- {name: "%s", server: "%s", port: %s, type: snell, psk: "%s", version: %s}%b\n' \
+        "$GREEN" "$mihomo_name" "$mihomo_server" "$port" "$mihomo_psk" "$proto" "$NC"
 
     print_header "Shadowrocket URL"
     local shadowrocket_payload shadowrocket_name shadowrocket_tfo
     shadowrocket_payload=$(base64_encode "chacha20-ietf-poly1305:${psk}@${ip}:${port}")
     shadowrocket_name=$(url_encode "$node_name")
     if [ "$tfo" = "true" ]; then shadowrocket_tfo="1"; else shadowrocket_tfo="0"; fi
-    printf '%bsnell://%s?tfo=%s&version=5#%s%b\n' \
-        "$GREEN" "$shadowrocket_payload" "$shadowrocket_tfo" "$shadowrocket_name" "$NC"
+    printf '%bsnell://%s?tfo=%s&version=%s#%s%b\n' \
+        "$GREEN" "$shadowrocket_payload" "$shadowrocket_tfo" "$proto" "$shadowrocket_name" "$NC"
 
     print_header "Service"
     systemctl is-active --quiet "$SERVICE_NAME" \
@@ -640,12 +794,14 @@ do_install() {
     print_header "OpenSnell server installer"
     echo -e "${BOLD}Choose a variant:${NC}"
     echo -e "${GREEN}1)${NC} OpenSnell ${YELLOW}(default, GPLv3, all-platform)${NC}"
-    echo -e "${GREEN}2)${NC} Surge official snell-server v5.0.1 ${YELLOW}(closed-source, Linux only)${NC}"
+    echo -e "${GREEN}2)${NC} Surge official snell-server ${SURGE_V5_VERSION} ${YELLOW}(closed-source, Linux only)${NC}"
+    echo -e "${GREEN}3)${NC} Surge official snell-server ${SURGE_V6_VERSION} ${YELLOW}(closed-source beta, protocol v6, Linux only)${NC}"
     echo
     read -r -p "$(echo -e "${CYAN}Variant [${BOLD}1${NC}${CYAN}]: ${NC}")" variant_choice
     case "${variant_choice:-1}" in
         1) download_opensnell ;;
-        2) download_surge     ;;
+        2) download_surge "$SURGE_V5_VERSION" ;;
+        3) download_surge "$SURGE_V6_VERSION" ;;
         *) print_error "Invalid choice"; exit 1 ;;
     esac
 
@@ -679,7 +835,12 @@ do_update() {
     [ -z "$variant" ] && variant="opensnell"
     print_info "Updating variant: $variant"
     if [ "$variant" = "surge" ]; then
-        download_surge
+        # Stay on the installed major: a v6 install updates within v6,
+        # everything else (including pre-v6-support meta) stays on v5.
+        case "$(get_installed_version)" in
+            v6*) download_surge "$SURGE_V6_VERSION" ;;
+            *)   download_surge "$SURGE_V5_VERSION" ;;
+        esac
     else
         download_opensnell
     fi
