@@ -17,7 +17,7 @@ mkdir -p "$CONF_DIR"
 : "${SNELL_PSK:=}"
 
 if [ -z "$SNELL_PSK" ]; then
-    SNELL_PSK="$(head -c 18 /dev/urandom | base64 | tr -d '/+=' | cut -c1-24)"
+    SNELL_PSK="$(head -c 48 /dev/urandom | base64 | tr -d '/+=' | cut -c1-32)"
     echo "[entrypoint] SNELL_PSK not set; generated PSK: ${SNELL_PSK}" >&2
 fi
 

@@ -126,7 +126,7 @@ ensure_tools() {
 # ============================================================================
 # Helpers
 # ============================================================================
-gen_psk() { openssl rand -base64 18 | tr -d '/+=' | cut -c1-24; }
+gen_psk() { openssl rand -base64 48 | tr -d '/+=' | cut -c1-32; }
 
 base64_encode() {
     if command -v base64 >/dev/null 2>&1; then
